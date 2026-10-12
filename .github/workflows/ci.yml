@@ -147,7 +147,7 @@ jobs:
           python-version: ${{ inputs.python-version || '3.13' }}
 
       - name: Download package artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: package
           path: downloaded-package
