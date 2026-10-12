@@ -1,0 +1,243 @@
+name: Day 2 CI
+
+run-name: "Day 2 CI triggered by @${{ github.actor }}"
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+
+  pull_request:
+    branches:
+      - main
+
+  workflow_dispatch:
+    inputs:
+      python-version:
+        description: Python version
+        type: choice
+        options:
+          - '3.12'
+          - '3.13'
+        default: '3.13'
+        required: true
+
+      create-package:
+        description: Create the application package
+        type: boolean
+        default: true
+        required: true
+
+  schedule:
+    - cron: '0 7 * * 1'
+
+permissions:
+  contents: read
+
+env:
+  APP_NAME: temperature
+
+jobs:
+  test:
+    name: Run Python Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version || '3.13' }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Create reports directory
+        run: mkdir -p reports
+
+      - name: Run pytest
+        run: python -m pytest -v --junitxml=reports/junit.xml
+
+      - name: Report test failure
+        if: failure()
+        env:
+          BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+        run: |
+          echo "🚨 Tests failed on ${BRANCH_NAME}"
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report
+          path: reports/junit.xml
+          if-no-files-found: warn
+          retention-days: 5
+
+  package:
+    name: Build Application Package
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    if: >-
+      needs.test.result == 'success' &&
+      (github.event_name != 'workflow_dispatch' ||
+      inputs.create-package == true)
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version || '3.13' }}
+
+      - name: Compute package version
+        id: version
+        run: |
+          echo "version=0.1.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Build package
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+          APP_NAME: ${{ env.APP_NAME }}
+        run: |
+          mkdir -p dist package-content
+
+          cp temperature.py package-content/
+          cp README.md package-content/
+
+          tar -czf "dist/${APP_NAME}-${PACKAGE_VERSION}.tar.gz" \
+            -C package-content \
+            temperature.py README.md
+
+          tar -tzf "dist/${APP_NAME}-${PACKAGE_VERSION}.tar.gz"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: dist/temperature-${{ steps.version.outputs.version }}.tar.gz
+          if-no-files-found: error
+          retention-days: 5
+
+  verify:
+    name: Verify Packaged Application
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version || '3.13' }}
+
+      - name: Download package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: package
+          path: downloaded-package
+
+      - name: Extract package
+        run: |
+          mkdir extracted
+
+          tar -xzf downloaded-package/temperature-*.tar.gz \
+            -C extracted
+
+          test -f extracted/temperature.py
+          test -f extracted/README.md
+
+      - name: Test packaged application
+        working-directory: extracted
+        run: |
+          python3 -c "from temperature import celsius_to_fahrenheit as c; assert c(100) == 212; print('Package OK')"
+
+  report:
+    name: Generate CI Report
+    needs:
+      - test
+      - package
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    env:
+      HAS_NOTIFY_TOKEN: ${{ secrets.NOTIFY_TOKEN != '' }}
+
+    steps:
+      - name: Generate job summary
+        env:
+          REPORT_TITLE: ${{ vars.REPORT_TITLE }}
+          APP_NAME: ${{ env.APP_NAME }}
+          PACKAGE_VERSION: ${{ needs.package.outputs.version }}
+          COMMIT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          TEST_RESULT: ${{ needs.test.result }}
+          PACKAGE_RESULT: ${{ needs.package.result }}
+        run: |
+          TITLE="${REPORT_TITLE:-Temperature CI Report}"
+          VERSION="${PACKAGE_VERSION:-n/a}"
+          SHORT_SHA="${COMMIT_SHA:0:7}"
+
+          {
+            echo "# ${TITLE}"
+            echo
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| App | ${APP_NAME} |"
+            echo "| Version | ${VERSION} |"
+            echo "| Commit | ${SHORT_SHA} |"
+            echo "| Event | ${EVENT_NAME} |"
+            echo "| Test result | ${TEST_RESULT} |"
+            echo "| Package result | ${PACKAGE_RESULT} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Simulate notification
+        if: env.HAS_NOTIFY_TOKEN == 'true'
+        env:
+          NOTIFY_TOKEN: ${{ secrets.NOTIFY_TOKEN }}
+        run: |
+          echo "Notification sent (token length: ${#NOTIFY_TOKEN})"
+
+  pr-comment:
+    name: Comment on Pull Request
+    needs: package
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.package.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      pull-requests: write
+
+    steps:
+      - name: Comment with package version
+        uses: actions/github-script@v7
+        env:
+          PACKAGE_VERSION: ${{ needs.package.outputs.version }}
+        with:
+          script: |
+            const version = process.env.PACKAGE_VERSION;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `✅ CI passed. Package version ${version} is ready.`
+            });
